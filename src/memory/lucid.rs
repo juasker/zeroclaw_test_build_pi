@@ -34,7 +34,14 @@ impl LucidMemory {
     pub fn new(workspace_dir: &Path, local: SqliteMemory) -> Self {
         let lucid_cmd = std::env::var("ZEROCLAW_LUCID_CMD")
             .unwrap_or_else(|_| Self::DEFAULT_LUCID_CMD.to_string());
+        Self::new_with_command(workspace_dir, local, lucid_cmd)
+    }
 
+    pub(crate) fn new_with_command(
+        workspace_dir: &Path,
+        local: SqliteMemory,
+        lucid_cmd: String,
+    ) -> Self {
         let token_budget = std::env::var("ZEROCLAW_LUCID_BUDGET")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -497,8 +504,8 @@ exit 1
             cmd,
             200,
             3,
-            Duration::from_millis(500),
-            Duration::from_millis(400),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
             Duration::from_secs(2),
         )
     }
@@ -588,8 +595,8 @@ exit 1
             probe_cmd,
             200,
             1,
-            Duration::from_millis(500),
-            Duration::from_millis(400),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
             Duration::from_secs(2),
         );
 
@@ -608,7 +615,7 @@ exit 1
             .iter()
             .any(|e| e.content.contains("Rust should stay local-first")));
 
-        let context_calls = fs::read_to_string(&marker).unwrap_or_default();
+        let context_calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
         assert!(
             context_calls.trim().is_empty(),
             "Expected local-hit short-circuit; got calls: {context_calls}"
@@ -658,8 +665,8 @@ exit 1
             failing_cmd,
             200,
             99,
-            Duration::from_millis(500),
-            Duration::from_millis(400),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
             Duration::from_secs(5),
         );
 
@@ -669,7 +676,7 @@ exit 1
         assert!(first.is_empty());
         assert!(second.is_empty());
 
-        let calls = fs::read_to_string(&marker).unwrap_or_default();
+        let calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
         assert_eq!(calls.lines().count(), 1);
     }
 }

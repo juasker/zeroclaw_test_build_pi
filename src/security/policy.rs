@@ -1,10 +1,11 @@
 use parking_lot::Mutex;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 /// How much autonomy the agent has
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AutonomyLevel {
     /// Read-only: can observe but not act
@@ -14,6 +15,21 @@ pub enum AutonomyLevel {
     Supervised,
     /// Full: autonomous execution within policy bounds
     Full,
+}
+
+impl std::str::FromStr for AutonomyLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "read_only" | "readonly" => Ok(Self::ReadOnly),
+            "supervised" => Ok(Self::Supervised),
+            "full" => Ok(Self::Full),
+            _ => Err(format!(
+                "invalid autonomy level '{s}': expected read_only, supervised, or full"
+            )),
+        }
+    }
 }
 
 /// Risk score for shell command execution.
@@ -84,10 +100,14 @@ pub struct SecurityPolicy {
     pub workspace_only: bool,
     pub allowed_commands: Vec<String>,
     pub forbidden_paths: Vec<String>,
+    pub allowed_roots: Vec<PathBuf>,
     pub max_actions_per_hour: u32,
     pub max_cost_per_day_cents: u32,
     pub require_approval_for_medium_risk: bool,
     pub block_high_risk_commands: bool,
+    pub shell_env_passthrough: Vec<String>,
+    pub allow_sensitive_file_reads: bool,
+    pub allow_sensitive_file_writes: bool,
     pub tracker: ActionTracker,
 }
 
@@ -110,6 +130,7 @@ impl Default for SecurityPolicy {
                 "wc".into(),
                 "head".into(),
                 "tail".into(),
+                "date".into(),
             ],
             forbidden_paths: vec![
                 // System directories (blocked even when workspace_only=false)
@@ -127,21 +148,52 @@ impl Default for SecurityPolicy {
                 "/sys".into(),
                 "/var".into(),
                 "/tmp".into(),
+                "/mnt".into(),
                 // Sensitive dotfiles
                 "~/.ssh".into(),
                 "~/.gnupg".into(),
                 "~/.aws".into(),
                 "~/.config".into(),
             ],
+            allowed_roots: Vec::new(),
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
+            shell_env_passthrough: vec![],
+            allow_sensitive_file_reads: false,
+            allow_sensitive_file_writes: false,
             tracker: ActionTracker::new(),
         }
     }
 }
 
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+fn expand_user_path(path: &str) -> PathBuf {
+    if path == "~" {
+        if let Some(home) = home_dir() {
+            return home;
+        }
+    }
+
+    if let Some(stripped) = path.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return home.join(stripped);
+        }
+    }
+
+    PathBuf::from(path)
+}
+
+// ── Shell Command Parsing Utilities ───────────────────────────────────────
+// These helpers implement a minimal quote-aware shell lexer. They exist
+// because security validation must reason about the *structure* of a
+// command (separators, operators, quoting) rather than treating it as a
+// flat string — otherwise an attacker could hide dangerous sub-commands
+// inside quoted arguments or chained operators.
 /// Skip leading environment variable assignments (e.g. `FOO=bar cmd args`).
 /// Returns the remainder starting at the first non-assignment word.
 fn skip_env_assignments(s: &str) -> &str {
@@ -165,45 +217,366 @@ fn skip_env_assignments(s: &str) -> &str {
     }
 }
 
-/// Detect a single `&` operator (background/chain). `&&` is allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuoteState {
+    None,
+    Single,
+    Double,
+}
+
+/// Split a shell command into sub-commands by unquoted separators.
+///
+/// Separators:
+/// - `;` and newline
+/// - `|`
+/// - `&&`, `||`
+///
+/// Characters inside single or double quotes are treated as literals, so
+/// `sqlite3 db "SELECT 1; SELECT 2;"` remains a single segment.
+fn split_unquoted_segments(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+    let mut chars = command.chars().peekable();
+
+    let push_segment = |segments: &mut Vec<String>, current: &mut String| {
+        let trimmed = current.trim();
+        if !trimmed.is_empty() {
+            segments.push(trimmed.to_string());
+        }
+        current.clear();
+    };
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+                current.push(ch);
+            }
+            QuoteState::Double => {
+                if escaped {
+                    escaped = false;
+                    current.push(ch);
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    current.push(ch);
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::None;
+                }
+                current.push(ch);
+            }
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                    current.push(ch);
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    current.push(ch);
+                    continue;
+                }
+
+                match ch {
+                    '\'' => {
+                        quote = QuoteState::Single;
+                        current.push(ch);
+                    }
+                    '"' => {
+                        quote = QuoteState::Double;
+                        current.push(ch);
+                    }
+                    ';' | '\n' => push_segment(&mut segments, &mut current),
+                    '|' => {
+                        if chars.next_if_eq(&'|').is_some() {
+                            // Consume full `||`; both characters are separators.
+                        }
+                        push_segment(&mut segments, &mut current);
+                    }
+                    '&' => {
+                        if chars.next_if_eq(&'&').is_some() {
+                            // `&&` is a separator; single `&` is handled separately.
+                            push_segment(&mut segments, &mut current);
+                        } else {
+                            current.push(ch);
+                        }
+                    }
+                    _ => current.push(ch),
+                }
+            }
+        }
+    }
+
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        segments.push(trimmed.to_string());
+    }
+
+    segments
+}
+
+/// Detect a single unquoted `&` operator (background/chain). `&&` is allowed.
 ///
 /// We treat any standalone `&` as unsafe in policy validation because it can
 /// chain hidden sub-commands and escape foreground timeout expectations.
-fn contains_single_ampersand(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    for (i, b) in bytes.iter().enumerate() {
-        if *b != b'&' {
-            continue;
-        }
-        let prev_is_amp = i > 0 && bytes[i - 1] == b'&';
-        let next_is_amp = i + 1 < bytes.len() && bytes[i + 1] == b'&';
-        if !prev_is_amp && !next_is_amp {
-            return true;
+fn contains_unquoted_single_ampersand(command: &str) -> bool {
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::Double => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                match ch {
+                    '\'' => quote = QuoteState::Single,
+                    '"' => quote = QuoteState::Double,
+                    '&' => {
+                        if chars.next_if_eq(&'&').is_none() {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
     }
+
     false
 }
 
-impl SecurityPolicy {
-    /// Classify command risk. Any high-risk segment marks the whole command high.
-    pub fn command_risk_level(&self, command: &str) -> CommandRiskLevel {
-        let mut normalized = command.to_string();
-        for sep in ["&&", "||"] {
-            normalized = normalized.replace(sep, "\x00");
-        }
-        for sep in ['\n', ';', '|', '&'] {
-            normalized = normalized.replace(sep, "\x00");
-        }
+/// Detect an unquoted character in a shell command.
+fn contains_unquoted_char(command: &str, target: char) -> bool {
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
 
-        let mut saw_medium = false;
+    for ch in command.chars() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::Double => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                match ch {
+                    '\'' => quote = QuoteState::Single,
+                    '"' => quote = QuoteState::Double,
+                    _ if ch == target => return true,
+                    _ => {}
+                }
+            }
+        }
+    }
 
-        for segment in normalized.split('\x00') {
-            let segment = segment.trim();
-            if segment.is_empty() {
+    false
+}
+
+/// Detect unquoted shell variable expansions like `$HOME`, `$1`, `$?`.
+///
+/// Escaped dollars (`\$`) are ignored. Variables inside single quotes are
+/// treated as literals and therefore ignored.
+fn contains_unquoted_shell_variable_expansion(command: &str) -> bool {
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+    let chars: Vec<char> = command.chars().collect();
+
+    for i in 0..chars.len() {
+        let ch = chars[i];
+
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
                 continue;
             }
+            QuoteState::Double => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::None;
+                    continue;
+                }
+            }
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == '\'' {
+                    quote = QuoteState::Single;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::Double;
+                    continue;
+                }
+            }
+        }
 
-            let cmd_part = skip_env_assignments(segment);
+        if ch != '$' {
+            continue;
+        }
+
+        let Some(next) = chars.get(i + 1).copied() else {
+            continue;
+        };
+        if next.is_ascii_alphanumeric()
+            || matches!(
+                next,
+                '_' | '{' | '(' | '#' | '?' | '!' | '$' | '*' | '@' | '-'
+            )
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn strip_wrapping_quotes(token: &str) -> &str {
+    token.trim_matches(|c| c == '"' || c == '\'')
+}
+
+fn looks_like_path(candidate: &str) -> bool {
+    candidate.starts_with('/')
+        || candidate.starts_with("./")
+        || candidate.starts_with("../")
+        || candidate.starts_with('~')
+        || candidate == "."
+        || candidate == ".."
+        || candidate.contains('/')
+}
+
+fn attached_short_option_value(token: &str) -> Option<&str> {
+    // Examples:
+    // -f/etc/passwd   -> /etc/passwd
+    // -C../outside    -> ../outside
+    // -I./include     -> ./include
+    let body = token.strip_prefix('-')?;
+    if body.starts_with('-') || body.len() < 2 {
+        return None;
+    }
+    let value = body[1..].trim_start_matches('=').trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn redirection_target(token: &str) -> Option<&str> {
+    let marker_idx = token.find(['<', '>'])?;
+    let mut rest = &token[marker_idx + 1..];
+    rest = rest.trim_start_matches(['<', '>']);
+    rest = rest.trim_start_matches('&');
+    rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &str) -> bool {
+    let allowed = strip_wrapping_quotes(allowed).trim();
+    if allowed.is_empty() {
+        return false;
+    }
+
+    // Explicit wildcard support for "allow any command name/path".
+    if allowed == "*" {
+        return true;
+    }
+
+    // Path-like allowlist entries must match the executable token exactly
+    // after "~" expansion.
+    if looks_like_path(allowed) {
+        let allowed_path = expand_user_path(allowed);
+        let executable_path = expand_user_path(executable);
+        return executable_path == allowed_path;
+    }
+
+    // Command-name entries continue to match by basename.
+    allowed == executable_base
+}
+
+impl SecurityPolicy {
+    // ── Risk Classification ──────────────────────────────────────────────
+    // Risk is assessed per-segment (split on shell operators), and the
+    // highest risk across all segments wins. This prevents bypasses like
+    // `ls && rm -rf /` from being classified as Low just because `ls` is safe.
+
+    /// Classify command risk. Any high-risk segment marks the whole command high.
+    pub fn command_risk_level(&self, command: &str) -> CommandRiskLevel {
+        let mut saw_medium = false;
+
+        for segment in split_unquoted_segments(command) {
+            let cmd_part = skip_env_assignments(&segment);
             let mut words = cmd_part.split_whitespace();
             let Some(base_raw) = words.next() else {
                 continue;
@@ -305,6 +678,15 @@ impl SecurityPolicy {
         }
     }
 
+    // ── Command Execution Policy Gate ──────────────────────────────────────
+    // Validation follows a strict precedence order:
+    //   1. Allowlist check (is the base command permitted at all?)
+    //   2. Risk classification (high / medium / low)
+    //   3. Policy flags (block_high_risk_commands, require_approval_for_medium_risk)
+    //   4. Autonomy level × approval status (supervised requires explicit approval)
+    // This ordering ensures deny-by-default: unknown commands are rejected
+    // before any risk or autonomy logic runs.
+
     /// Validate full command execution policy (allowlist + risk gate).
     pub fn validate_command_execution(
         &self,
@@ -315,10 +697,21 @@ impl SecurityPolicy {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
 
+        if let Some(path) = self.forbidden_path_argument(command) {
+            return Err(format!("Path blocked by security policy: {path}"));
+        }
+
         let risk = self.command_risk_level(command);
 
         if risk == CommandRiskLevel::High {
             if self.block_high_risk_commands {
+                let lower = command.to_ascii_lowercase();
+                if lower.contains("curl") || lower.contains("wget") {
+                    return Err(
+                        "Command blocked: high-risk command is disallowed by policy. Shell curl/wget are blocked; use `http_request` or `web_fetch` with configured allowed_domains."
+                            .into(),
+                    );
+                }
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
             }
             if self.autonomy == AutonomyLevel::Supervised && !approved {
@@ -342,6 +735,11 @@ impl SecurityPolicy {
         Ok(risk)
     }
 
+    // ── Layered Command Allowlist ──────────────────────────────────────────
+    // Defence-in-depth: five independent gates run in order before the
+    // per-segment allowlist check. Each gate targets a specific bypass
+    // technique. If any gate rejects, the whole command is blocked.
+
     /// Check if a shell command is allowed.
     ///
     /// Validates the **entire** command string, not just the first word:
@@ -349,7 +747,7 @@ impl SecurityPolicy {
     /// - Splits on command separators (`|`, `&&`, `||`, `;`, newlines) and
     ///   validates each sub-command against the allowlist
     /// - Blocks single `&` background chaining (`&&` remains supported)
-    /// - Blocks output redirections (`>`, `>>`) that could write outside workspace
+    /// - Blocks shell redirections (`<`, `>`, `>>`) that can bypass path policy
     /// - Blocks dangerous arguments (e.g. `find -exec`, `git config`)
     pub fn is_command_allowed(&self, command: &str) -> bool {
         if self.autonomy == AutonomyLevel::ReadOnly {
@@ -357,18 +755,22 @@ impl SecurityPolicy {
         }
 
         // Block subshell/expansion operators — these allow hiding arbitrary
-        // commands inside an allowed command (e.g. `echo $(rm -rf /)`)
+        // commands inside an allowed command (e.g. `echo $(rm -rf /)`) and
+        // bypassing path checks through variable indirection. The helper below
+        // ignores escapes and literals inside single quotes, so `$(` or `${`
+        // literals are permitted there.
         if command.contains('`')
-            || command.contains("$(")
-            || command.contains("${")
+            || contains_unquoted_shell_variable_expansion(command)
             || command.contains("<(")
             || command.contains(">(")
         {
             return false;
         }
 
-        // Block output redirections — they can write to arbitrary paths
-        if command.contains('>') {
+        // Block shell redirections (`<`, `>`, `>>`) — they can read/write
+        // arbitrary paths and bypass path checks.
+        // Ignore quoted literals, e.g. `echo "a>b"` and `echo "a<b"`.
+        if contains_unquoted_char(command, '>') || contains_unquoted_char(command, '<') {
             return false;
         }
 
@@ -383,32 +785,19 @@ impl SecurityPolicy {
 
         // Block background command chaining (`&`), which can hide extra
         // sub-commands and outlive timeout expectations. Keep `&&` allowed.
-        if contains_single_ampersand(command) {
+        if contains_unquoted_single_ampersand(command) {
             return false;
         }
 
-        // Split on command separators and validate each sub-command.
-        // We collect segments by scanning for separator characters.
-        let mut normalized = command.to_string();
-        for sep in ["&&", "||"] {
-            normalized = normalized.replace(sep, "\x00");
-        }
-        for sep in ['\n', ';', '|'] {
-            normalized = normalized.replace(sep, "\x00");
-        }
-
-        for segment in normalized.split('\x00') {
-            let segment = segment.trim();
-            if segment.is_empty() {
-                continue;
-            }
-
+        // Split on unquoted command separators and validate each sub-command.
+        let segments = split_unquoted_segments(command);
+        for segment in &segments {
             // Strip leading env var assignments (e.g. FOO=bar cmd)
             let cmd_part = skip_env_assignments(segment);
 
             let mut words = cmd_part.split_whitespace();
-            let base_raw = words.next().unwrap_or("");
-            let base_cmd = base_raw.rsplit('/').next().unwrap_or("");
+            let executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+            let base_cmd = executable.rsplit('/').next().unwrap_or("");
 
             if base_cmd.is_empty() {
                 continue;
@@ -417,7 +806,7 @@ impl SecurityPolicy {
             if !self
                 .allowed_commands
                 .iter()
-                .any(|allowed| allowed == base_cmd)
+                .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd))
             {
                 return false;
             }
@@ -430,7 +819,7 @@ impl SecurityPolicy {
         }
 
         // At least one command must be present
-        let has_cmd = normalized.split('\x00').any(|s| {
+        let has_cmd = segments.iter().any(|s| {
             let s = skip_env_assignments(s.trim());
             s.split_whitespace().next().is_some_and(|w| !w.is_empty())
         });
@@ -447,19 +836,186 @@ impl SecurityPolicy {
                 !args.iter().any(|arg| arg == "-exec" || arg == "-ok")
             }
             "git" => {
-                // git config, alias, and -c can be used to set dangerous options
-                // (e.g. git config core.editor "rm -rf /")
-                !args.iter().any(|arg| {
-                    arg == "config"
-                        || arg.starts_with("config.")
-                        || arg == "alias"
-                        || arg.starts_with("alias.")
-                        || arg == "-c"
-                })
+                // Global git config injection can be used to set dangerous options
+                // (e.g., pager/editor/credential helpers) even without `git config`.
+                if args.iter().any(|arg| {
+                    arg == "-c"
+                        || arg == "--config"
+                        || arg.starts_with("--config=")
+                        || arg == "--config-env"
+                        || arg.starts_with("--config-env=")
+                }) {
+                    return false;
+                }
+
+                // Determine subcommand by first non-option token.
+                let Some(subcommand_index) = args.iter().position(|arg| !arg.starts_with('-'))
+                else {
+                    return true;
+                };
+                let subcommand = args[subcommand_index].as_str();
+
+                // `git alias` can create executable aliases.
+                if subcommand == "alias" || subcommand.starts_with("alias.") {
+                    return false;
+                }
+
+                // Only `git config` needs special handling. Other git subcommands are
+                // allowed after the global option checks above.
+                if subcommand != "config" {
+                    return true;
+                }
+
+                let config_args = &args[subcommand_index + 1..];
+
+                // Allow ONLY read-only operations.
+                let has_readonly_flag = config_args.iter().any(|arg| {
+                    matches!(
+                        arg.as_str(),
+                        "--get" | "--list" | "-l" | "--get-all" | "--get-regexp" | "--get-urlmatch"
+                    )
+                });
+                if !has_readonly_flag {
+                    return false;
+                }
+
+                // Explicit write/edit operations must never be mixed with reads.
+                let has_write_flag = config_args.iter().any(|arg| {
+                    matches!(
+                        arg.as_str(),
+                        "--add"
+                            | "--replace-all"
+                            | "--unset"
+                            | "--unset-all"
+                            | "--edit"
+                            | "-e"
+                            | "--rename-section"
+                            | "--remove-section"
+                    )
+                });
+                if has_write_flag {
+                    return false;
+                }
+
+                // Reject unknown config flags to avoid option-based bypasses.
+                let has_unknown_flag = config_args.iter().any(|arg| {
+                    if !arg.starts_with('-') {
+                        return false;
+                    }
+
+                    let is_known_flag = matches!(
+                        arg.as_str(),
+                        "--get"
+                            | "--list"
+                            | "-l"
+                            | "--get-all"
+                            | "--get-regexp"
+                            | "--get-urlmatch"
+                            | "--global"
+                            | "--system"
+                            | "--local"
+                            | "--worktree"
+                            | "--show-origin"
+                            | "--show-scope"
+                            | "--null"
+                            | "-z"
+                            | "--name-only"
+                            | "--includes"
+                            | "--no-includes"
+                    ) || arg == "--file"
+                        || arg == "-f"
+                        || arg.starts_with("--file=")
+                        || arg == "--blob"
+                        || arg.starts_with("--blob=")
+                        || arg == "--default"
+                        || arg.starts_with("--default=")
+                        || arg == "--type"
+                        || arg.starts_with("--type=");
+
+                    !is_known_flag
+                });
+                if has_unknown_flag {
+                    return false;
+                }
+
+                true
             }
             _ => true,
         }
     }
+
+    /// Return the first path-like argument blocked by path policy.
+    ///
+    /// This is best-effort token parsing for shell commands and is intended
+    /// as a safety gate before command execution.
+    pub fn forbidden_path_argument(&self, command: &str) -> Option<String> {
+        let forbidden_candidate = |raw: &str| {
+            let candidate = strip_wrapping_quotes(raw).trim();
+            if candidate.is_empty() || candidate.contains("://") {
+                return None;
+            }
+            if looks_like_path(candidate) && !self.is_path_allowed(candidate) {
+                Some(candidate.to_string())
+            } else {
+                None
+            }
+        };
+
+        for segment in split_unquoted_segments(command) {
+            let cmd_part = skip_env_assignments(&segment);
+            let mut words = cmd_part.split_whitespace();
+            let Some(executable) = words.next() else {
+                continue;
+            };
+
+            // Cover inline forms like `cat</etc/passwd`.
+            if let Some(target) = redirection_target(strip_wrapping_quotes(executable)) {
+                if let Some(blocked) = forbidden_candidate(target) {
+                    return Some(blocked);
+                }
+            }
+
+            for token in words {
+                let candidate = strip_wrapping_quotes(token).trim();
+                if candidate.is_empty() || candidate.contains("://") {
+                    continue;
+                }
+
+                if let Some(target) = redirection_target(candidate) {
+                    if let Some(blocked) = forbidden_candidate(target) {
+                        return Some(blocked);
+                    }
+                }
+
+                // Handle option assignment forms like `--file=/etc/passwd`.
+                if candidate.starts_with('-') {
+                    if let Some((_, value)) = candidate.split_once('=') {
+                        if let Some(blocked) = forbidden_candidate(value) {
+                            return Some(blocked);
+                        }
+                    }
+                    if let Some(value) = attached_short_option_value(candidate) {
+                        if let Some(blocked) = forbidden_candidate(value) {
+                            return Some(blocked);
+                        }
+                    }
+                    continue;
+                }
+
+                if let Some(blocked) = forbidden_candidate(candidate) {
+                    return Some(blocked);
+                }
+            }
+        }
+
+        None
+    }
+
+    // ── Path Validation ────────────────────────────────────────────────
+    // Layered checks: null-byte injection → component-level traversal →
+    // URL-encoded traversal → tilde expansion → absolute-path block →
+    // forbidden-prefix match. Each layer addresses a distinct escape
+    // technique; together they enforce workspace confinement.
 
     /// Check if a file path is allowed (no path traversal, within workspace)
     pub fn is_path_allowed(&self, path: &str) -> bool {
@@ -482,35 +1038,23 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Expand tilde for comparison
-        let expanded = if let Some(stripped) = path.strip_prefix("~/") {
-            if let Some(home) = std::env::var("HOME").ok().map(PathBuf::from) {
-                home.join(stripped).to_string_lossy().to_string()
-            } else {
-                path.to_string()
-            }
-        } else {
-            path.to_string()
-        };
+        // Reject "~user" forms because the shell expands them at runtime and
+        // they can escape workspace policy.
+        if path.starts_with('~') && path != "~" && !path.starts_with("~/") {
+            return false;
+        }
+
+        // Expand "~" for consistent matching with forbidden paths and allowlists.
+        let expanded_path = expand_user_path(path);
 
         // Block absolute paths when workspace_only is set
-        if self.workspace_only && Path::new(&expanded).is_absolute() {
+        if self.workspace_only && expanded_path.is_absolute() {
             return false;
         }
 
         // Block forbidden paths using path-component-aware matching
-        let expanded_path = Path::new(&expanded);
         for forbidden in &self.forbidden_paths {
-            let forbidden_expanded = if let Some(stripped) = forbidden.strip_prefix("~/") {
-                if let Some(home) = std::env::var("HOME").ok().map(PathBuf::from) {
-                    home.join(stripped).to_string_lossy().to_string()
-                } else {
-                    forbidden.clone()
-                }
-            } else {
-                forbidden.clone()
-            };
-            let forbidden_path = Path::new(&forbidden_expanded);
+            let forbidden_path = expand_user_path(forbidden);
             if expanded_path.starts_with(forbidden_path) {
                 return false;
             }
@@ -519,23 +1063,70 @@ impl SecurityPolicy {
         true
     }
 
-    /// Validate that a resolved path is still inside the workspace.
+    /// Validate that a resolved path is inside the workspace or an allowed root.
     /// Call this AFTER joining `workspace_dir` + relative path and canonicalizing.
     pub fn is_resolved_path_allowed(&self, resolved: &Path) -> bool {
-        // Must be under workspace_dir (prevents symlink escapes).
         // Prefer canonical workspace root so `/a/../b` style config paths don't
         // cause false positives or negatives.
         let workspace_root = self
             .workspace_dir
             .canonicalize()
             .unwrap_or_else(|_| self.workspace_dir.clone());
-        resolved.starts_with(workspace_root)
+        if resolved.starts_with(&workspace_root) {
+            return true;
+        }
+
+        // Check extra allowed roots (e.g. shared skills directories) before
+        // forbidden checks so explicit allowlists can coexist with broad
+        // default forbidden roots such as `/home` and `/tmp`.
+        for root in &self.allowed_roots {
+            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+            if resolved.starts_with(&canonical) {
+                return true;
+            }
+        }
+
+        // For paths outside workspace/allowlist, block forbidden roots to
+        // prevent symlink escapes and sensitive directory access.
+        for forbidden in &self.forbidden_paths {
+            let forbidden_path = expand_user_path(forbidden);
+            if resolved.starts_with(&forbidden_path) {
+                return false;
+            }
+        }
+
+        // When workspace_only is disabled the user explicitly opted out of
+        // workspace confinement after forbidden-path checks are applied.
+        if !self.workspace_only {
+            return true;
+        }
+
+        false
+    }
+
+    pub fn resolved_path_violation_message(&self, resolved: &Path) -> String {
+        let guidance = if self.allowed_roots.is_empty() {
+            "Add the directory to [autonomy].allowed_roots (for example: allowed_roots = [\"/absolute/path\"]), or move the file into the workspace."
+        } else {
+            "Add a matching parent directory to [autonomy].allowed_roots, or move the file into the workspace."
+        };
+
+        format!(
+            "Resolved path escapes workspace allowlist: {}. {}",
+            resolved.display(),
+            guidance
+        )
     }
 
     /// Check if autonomy level permits any action at all
     pub fn can_act(&self) -> bool {
         self.autonomy != AutonomyLevel::ReadOnly
     }
+
+    // ── Tool Operation Gating ──────────────────────────────────────────────
+    // Read operations bypass autonomy and rate checks because they have
+    // no side effects. Act operations must pass both the autonomy gate
+    // (not read-only) and the sliding-window rate limiter.
 
     /// Enforce policy for a tool operation.
     ///
@@ -577,6 +1168,69 @@ impl SecurityPolicy {
     }
 
     /// Build from config sections
+    /// Produce a concise security-constraint summary suitable for periodic
+    /// re-injection into the conversation (safety heartbeat).
+    ///
+    /// The output is intentionally short (~100-150 tokens) so the token
+    /// overhead per heartbeat is negligible.
+    pub fn summary_for_heartbeat(&self) -> String {
+        let autonomy_label = match self.autonomy {
+            AutonomyLevel::ReadOnly => "read_only — side-effecting actions are blocked",
+            AutonomyLevel::Supervised => "supervised — destructive actions require approval",
+            AutonomyLevel::Full => "full — autonomous execution within policy bounds",
+        };
+
+        let workspace = self.workspace_dir.display();
+        let ws_only = self.workspace_only;
+
+        let forbidden_preview: String = {
+            let shown: Vec<&str> = self
+                .forbidden_paths
+                .iter()
+                .take(8)
+                .map(String::as_str)
+                .collect();
+            let remaining = self.forbidden_paths.len().saturating_sub(8);
+            if remaining > 0 {
+                format!("{} (+ {} more)", shown.join(", "), remaining)
+            } else {
+                shown.join(", ")
+            }
+        };
+
+        let commands_preview: String = {
+            let shown: Vec<&str> = self
+                .allowed_commands
+                .iter()
+                .take(8)
+                .map(String::as_str)
+                .collect();
+            let remaining = self.allowed_commands.len().saturating_sub(8);
+            if remaining > 0 {
+                format!("{} (+ {} more rejected)", shown.join(", "), remaining)
+            } else if shown.is_empty() {
+                "none (all rejected)".to_string()
+            } else {
+                format!("{} (others rejected)", shown.join(", "))
+            }
+        };
+
+        let high_risk = if self.block_high_risk_commands {
+            "blocked"
+        } else {
+            "allowed (caution)"
+        };
+
+        format!(
+            "- Autonomy: {autonomy_label}\n\
+             - Workspace: {workspace} (workspace_only: {ws_only})\n\
+             - Forbidden paths: {forbidden_preview}\n\
+             - Allowed commands: {commands_preview}\n\
+             - High-risk commands: {high_risk}\n\
+             - Do not exfiltrate data, bypass approval, or run destructive commands without asking."
+        )
+    }
+
     pub fn from_config(
         autonomy_config: &crate::config::AutonomyConfig,
         workspace_dir: &Path,
@@ -587,10 +1241,25 @@ impl SecurityPolicy {
             workspace_only: autonomy_config.workspace_only,
             allowed_commands: autonomy_config.allowed_commands.clone(),
             forbidden_paths: autonomy_config.forbidden_paths.clone(),
+            allowed_roots: autonomy_config
+                .allowed_roots
+                .iter()
+                .map(|root| {
+                    let expanded = expand_user_path(root);
+                    if expanded.is_absolute() {
+                        expanded
+                    } else {
+                        workspace_dir.join(expanded)
+                    }
+                })
+                .collect(),
             max_actions_per_hour: autonomy_config.max_actions_per_hour,
             max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
             block_high_risk_commands: autonomy_config.block_high_risk_commands,
+            shell_env_passthrough: autonomy_config.shell_env_passthrough.clone(),
+            allow_sensitive_file_reads: autonomy_config.allow_sensitive_file_reads,
+            allow_sensitive_file_writes: autonomy_config.allow_sensitive_file_writes,
             tracker: ActionTracker::new(),
         }
     }
@@ -689,6 +1358,7 @@ mod tests {
         assert!(p.is_command_allowed("cargo build --release"));
         assert!(p.is_command_allowed("cat file.txt"));
         assert!(p.is_command_allowed("grep -r pattern ."));
+        assert!(p.is_command_allowed("date"));
     }
 
     #[test]
@@ -722,6 +1392,33 @@ mod tests {
         let p = default_policy();
         assert!(p.is_command_allowed("/usr/bin/git status"));
         assert!(p.is_command_allowed("/bin/ls -la"));
+    }
+
+    #[test]
+    fn allowlist_supports_explicit_executable_paths() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["/usr/bin/antigravity".into()],
+            ..SecurityPolicy::default()
+        };
+
+        assert!(p.is_command_allowed("/usr/bin/antigravity"));
+        assert!(!p.is_command_allowed("antigravity"));
+    }
+
+    #[test]
+    fn allowlist_supports_wildcard_entry() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            ..SecurityPolicy::default()
+        };
+
+        assert!(p.is_command_allowed("python3 --version"));
+        assert!(p.is_command_allowed("/usr/bin/antigravity"));
+
+        // Wildcard still respects risk gates in validate_command_execution.
+        let blocked = p.validate_command_execution("rm -rf tmp_test_dir", true);
+        assert!(blocked.is_err());
+        assert!(blocked.unwrap_err().contains("high-risk"));
     }
 
     #[test]
@@ -824,9 +1521,22 @@ mod tests {
             ..SecurityPolicy::default()
         };
 
-        let result = p.validate_command_execution("rm -rf /tmp/test", true);
+        let result = p.validate_command_execution("rm -rf tmp_test_dir", true);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("high-risk"));
+    }
+
+    #[test]
+    fn validate_command_full_mode_skips_medium_risk_approval_gate() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            require_approval_for_medium_risk: true,
+            allowed_commands: vec!["touch".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let result = p.validate_command_execution("touch test.txt", false);
+        assert_eq!(result.unwrap(), CommandRiskLevel::Medium);
     }
 
     #[test]
@@ -912,6 +1622,9 @@ mod tests {
             max_cost_per_day_cents: 1000,
             require_approval_for_medium_risk: false,
             block_high_risk_commands: false,
+            shell_env_passthrough: vec!["DATABASE_URL".into()],
+            allow_sensitive_file_reads: true,
+            allow_sensitive_file_writes: true,
             ..crate::config::AutonomyConfig::default()
         };
         let workspace = PathBuf::from("/tmp/test-workspace");
@@ -925,7 +1638,37 @@ mod tests {
         assert_eq!(policy.max_cost_per_day_cents, 1000);
         assert!(!policy.require_approval_for_medium_risk);
         assert!(!policy.block_high_risk_commands);
+        assert_eq!(policy.shell_env_passthrough, vec!["DATABASE_URL"]);
+        assert!(policy.allow_sensitive_file_reads);
+        assert!(policy.allow_sensitive_file_writes);
         assert_eq!(policy.workspace_dir, PathBuf::from("/tmp/test-workspace"));
+    }
+
+    #[test]
+    fn from_config_normalizes_allowed_roots() {
+        let autonomy_config = crate::config::AutonomyConfig {
+            allowed_roots: vec!["~/Desktop".into(), "shared-data".into()],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let workspace = PathBuf::from("/tmp/test-workspace");
+        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+
+        let expected_home_root = if let Some(home) = std::env::var_os("HOME") {
+            PathBuf::from(home).join("Desktop")
+        } else {
+            PathBuf::from("~/Desktop")
+        };
+
+        assert_eq!(policy.allowed_roots[0], expected_home_root);
+        assert_eq!(policy.allowed_roots[1], workspace.join("shared-data"));
+    }
+
+    #[test]
+    fn resolved_path_violation_message_includes_allowed_roots_guidance() {
+        let p = default_policy();
+        let msg = p.resolved_path_violation_message(Path::new("/tmp/outside.txt"));
+        assert!(msg.contains("escapes workspace"));
+        assert!(msg.contains("allowed_roots"));
     }
 
     // ── Default policy ──────────────────────────────────────
@@ -941,6 +1684,7 @@ mod tests {
         assert!(p.max_cost_per_day_cents > 0);
         assert!(p.require_approval_for_medium_risk);
         assert!(p.block_high_risk_commands);
+        assert!(p.shell_env_passthrough.is_empty());
     }
 
     // ── ActionTracker / rate limiting ───────────────────────
@@ -1025,6 +1769,32 @@ mod tests {
     }
 
     #[test]
+    fn quoted_semicolons_do_not_split_sqlite_command() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["sqlite3".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed(
+            "sqlite3 /tmp/test.db \"CREATE TABLE t(id INT); INSERT INTO t VALUES(1); SELECT * FROM t;\""
+        ));
+        assert_eq!(
+            p.command_risk_level(
+                "sqlite3 /tmp/test.db \"CREATE TABLE t(id INT); INSERT INTO t VALUES(1); SELECT * FROM t;\""
+            ),
+            CommandRiskLevel::Low
+        );
+    }
+
+    #[test]
+    fn unquoted_semicolon_after_quoted_sql_still_splits_commands() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["sqlite3".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_command_allowed("sqlite3 /tmp/test.db \"SELECT 1;\"; rm -rf /"));
+    }
+
+    #[test]
     fn command_injection_backtick_blocked() {
         let p = default_policy();
         assert!(!p.is_command_allowed("echo `whoami`"));
@@ -1036,6 +1806,24 @@ mod tests {
         let p = default_policy();
         assert!(!p.is_command_allowed("echo $(cat /etc/passwd)"));
         assert!(!p.is_command_allowed("echo $(rm -rf /)"));
+    }
+
+    #[test]
+    fn command_injection_dollar_paren_literal_inside_single_quotes_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("echo '$(cat /etc/passwd)'"));
+    }
+
+    #[test]
+    fn command_injection_dollar_brace_literal_inside_single_quotes_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("echo '${HOME}'"));
+    }
+
+    #[test]
+    fn command_injection_dollar_brace_unquoted_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("echo ${HOME}"));
     }
 
     #[test]
@@ -1084,6 +1872,16 @@ mod tests {
         let p = default_policy();
         assert!(!p.is_command_allowed("echo secret > /etc/crontab"));
         assert!(!p.is_command_allowed("ls >> /tmp/exfil.txt"));
+        assert!(!p.is_command_allowed("cat </etc/passwd"));
+        assert!(!p.is_command_allowed("cat</etc/passwd"));
+    }
+
+    #[test]
+    fn quoted_ampersand_and_redirect_literals_are_not_treated_as_operators() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("echo \"A&B\""));
+        assert!(p.is_command_allowed("echo \"A>B\""));
+        assert!(p.is_command_allowed("echo \"A<B\""));
     }
 
     #[test]
@@ -1092,10 +1890,13 @@ mod tests {
         // find -exec is a common bypass
         assert!(!p.is_command_allowed("find . -exec rm -rf {} +"));
         assert!(!p.is_command_allowed("find / -ok cat {} \\;"));
-        // git config/alias can execute commands
+        // git config write operations can execute commands
         assert!(!p.is_command_allowed("git config core.editor \"rm -rf /\""));
         assert!(!p.is_command_allowed("git alias.st status"));
         assert!(!p.is_command_allowed("git -c core.editor=calc.exe commit"));
+        // git config without readonly flag is blocked
+        assert!(!p.is_command_allowed("git config user.name \"test\""));
+        assert!(!p.is_command_allowed("git config user.email test@example.com"));
         // Legitimate commands should still work
         assert!(p.is_command_allowed("find . -name '*.txt'"));
         assert!(p.is_command_allowed("git status"));
@@ -1103,9 +1904,77 @@ mod tests {
     }
 
     #[test]
+    fn git_config_readonly_operations_allowed() {
+        let p = default_policy();
+        // git config --get is read-only and safe
+        assert!(p.is_command_allowed("git config --get user.name"));
+        assert!(p.is_command_allowed("git config --get user.email"));
+        assert!(p.is_command_allowed("git config --get core.editor"));
+        // git config --list is read-only and safe
+        assert!(p.is_command_allowed("git config --list"));
+        assert!(p.is_command_allowed("git config -l"));
+        // git config --get-all is read-only
+        assert!(p.is_command_allowed("git config --get-all user.name"));
+        // git config --get-regexp is read-only
+        assert!(p.is_command_allowed("git config --get-regexp user.*"));
+        // git config --get-urlmatch is read-only
+        assert!(p.is_command_allowed("git config --get-urlmatch http.example.com"));
+        // scoped read operations are allowed
+        assert!(p.is_command_allowed("git config --global --get user.name"));
+        assert!(p.is_command_allowed("git config --local --list"));
+        assert!(p.is_command_allowed("git config --global --get user.name --show-origin"));
+        assert!(p.is_command_allowed("git config --default=unknown --get user.name"));
+    }
+
+    #[test]
+    fn git_config_write_operations_blocked() {
+        let p = default_policy();
+        // Plain git config (write) is blocked
+        assert!(!p.is_command_allowed("git config user.name test"));
+        assert!(!p.is_command_allowed("git config user.email test@example.com"));
+        // git config --unset is a write operation
+        assert!(!p.is_command_allowed("git config --unset user.name"));
+        // git config --add is a write operation
+        assert!(!p.is_command_allowed("git config --add user.name test"));
+        // git config --global without readonly flag is blocked
+        assert!(!p.is_command_allowed("git config --global user.name test"));
+        // git config --replace-all is a write operation
+        assert!(!p.is_command_allowed("git config --replace-all user.name test"));
+        // git config --edit is blocked (opens editor)
+        assert!(!p.is_command_allowed("git config -e"));
+        assert!(!p.is_command_allowed("git config --edit"));
+    }
+
+    #[test]
+    fn git_config_mixed_read_write_flags_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("git config --get --unset user.name"));
+        assert!(!p.is_command_allowed("git config --list --add user.name test"));
+        assert!(!p.is_command_allowed("git config --get-all --replace-all user.name test"));
+    }
+
+    #[test]
+    fn git_config_global_injection_flags_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("git --config-env=core.editor=EVIL_EDITOR status"));
+        assert!(!p.is_command_allowed("git --config=core.pager=cat status"));
+        assert!(
+            !p.is_command_allowed("git --config-env=credential.helper=EVIL config --get user.name")
+        );
+        assert!(!p.is_command_allowed("git --config=core.editor=vim config --get user.name"));
+    }
+
+    #[test]
     fn command_injection_dollar_brace_blocked() {
         let p = default_policy();
         assert!(!p.is_command_allowed("echo ${IFS}cat${IFS}/etc/passwd"));
+    }
+
+    #[test]
+    fn command_injection_plain_dollar_var_blocked() {
+        let p = default_policy();
+        assert!(!p.is_command_allowed("cat $HOME/.ssh/id_rsa"));
+        assert!(!p.is_command_allowed("cat $SECRET_FILE"));
     }
 
     #[test]
@@ -1131,6 +2000,115 @@ mod tests {
         assert!(p.is_command_allowed("LANG=C grep pattern file"));
         // env assignment + disallowed command — blocked
         assert!(!p.is_command_allowed("FOO=bar rm -rf /"));
+    }
+
+    #[test]
+    fn forbidden_path_argument_detects_absolute_path() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("cat /etc/passwd"),
+            Some("/etc/passwd".into())
+        );
+    }
+
+    #[test]
+    fn validate_command_execution_rejects_forbidden_paths() {
+        let p = default_policy();
+        let err = p
+            .validate_command_execution("cat /etc/shadow", false)
+            .unwrap_err();
+        assert!(err.contains("Path blocked by security policy"));
+    }
+
+    #[test]
+    fn forbidden_path_argument_detects_parent_dir_reference() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("cat ../secret.txt"),
+            Some("../secret.txt".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("find .. -name '*.rs'"),
+            Some("..".into())
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_allows_workspace_relative_paths() {
+        let p = default_policy();
+        assert_eq!(p.forbidden_path_argument("cat src/main.rs"), None);
+        assert_eq!(p.forbidden_path_argument("grep -r todo ./src"), None);
+    }
+
+    #[test]
+    fn forbidden_path_argument_detects_option_assignment_paths() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("grep --file=/etc/passwd root ./src"),
+            Some("/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("cat --input=../secret.txt"),
+            Some("../secret.txt".into())
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_allows_safe_option_assignment_paths() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("grep --file=./patterns.txt root ./src"),
+            None
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_detects_short_option_attached_paths() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("grep -f/etc/passwd root ./src"),
+            Some("/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("git -C../outside status"),
+            Some("../outside".into())
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_allows_safe_short_option_attached_paths() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("grep -f./patterns.txt root ./src"),
+            None
+        );
+        assert_eq!(p.forbidden_path_argument("git -C./repo status"), None);
+    }
+
+    #[test]
+    fn forbidden_path_argument_detects_tilde_user_paths() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("cat ~root/.ssh/id_rsa"),
+            Some("~root/.ssh/id_rsa".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("ls ~nobody"),
+            Some("~nobody".into())
+        );
+    }
+
+    #[test]
+    fn forbidden_path_argument_detects_input_redirection_paths() {
+        let p = default_policy();
+        assert_eq!(
+            p.forbidden_path_argument("cat </etc/passwd"),
+            Some("/etc/passwd".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument("cat</etc/passwd"),
+            Some("/etc/passwd".into())
+        );
     }
 
     // ── Edge cases: path traversal ──────────────────────────
@@ -1172,6 +2150,8 @@ mod tests {
         };
         assert!(!p.is_path_allowed("~/.ssh/id_rsa"));
         assert!(!p.is_path_allowed("~/.gnupg/secring.gpg"));
+        assert!(!p.is_path_allowed("~root/.ssh/id_rsa"));
+        assert!(!p.is_path_allowed("~nobody"));
     }
 
     #[test]
@@ -1252,6 +2232,78 @@ mod tests {
         assert!(!p.is_path_allowed("/root/.bashrc"));
     }
 
+    #[test]
+    fn workspace_only_false_allows_resolved_outside_workspace() {
+        let workspace = std::env::temp_dir().join("zeroclaw_test_ws_only_false");
+        let _ = std::fs::create_dir_all(&workspace);
+        let canonical_workspace = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.clone());
+
+        let p = SecurityPolicy {
+            workspace_dir: canonical_workspace.clone(),
+            workspace_only: false,
+            forbidden_paths: vec!["/etc".into(), "/var".into()],
+            ..SecurityPolicy::default()
+        };
+
+        // Path outside workspace should be allowed when workspace_only=false
+        let outside = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/home"))
+            .join("zeroclaw_outside_ws");
+        assert!(
+            p.is_resolved_path_allowed(&outside),
+            "workspace_only=false must allow resolved paths outside workspace"
+        );
+
+        // Forbidden paths must still be blocked even with workspace_only=false
+        assert!(
+            !p.is_resolved_path_allowed(Path::new("/etc/passwd")),
+            "forbidden paths must be blocked even when workspace_only=false"
+        );
+        assert!(
+            !p.is_resolved_path_allowed(Path::new("/var/run/docker.sock")),
+            "forbidden /var must be blocked even when workspace_only=false"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn workspace_only_true_blocks_resolved_outside_workspace() {
+        let workspace = std::env::temp_dir().join("zeroclaw_test_ws_only_true");
+        let _ = std::fs::create_dir_all(&workspace);
+        let canonical_workspace = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.clone());
+
+        let p = SecurityPolicy {
+            workspace_dir: canonical_workspace.clone(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+
+        // Path inside workspace — allowed
+        let inside = canonical_workspace.join("subdir");
+        assert!(
+            p.is_resolved_path_allowed(&inside),
+            "path inside workspace must be allowed"
+        );
+
+        // Path outside workspace — blocked
+        let outside = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join("zeroclaw_outside_ws_true");
+        assert!(
+            !p.is_resolved_path_allowed(&outside),
+            "workspace_only=true must block resolved paths outside workspace"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
     // ── Edge cases: from_config preserves tracker ────────────
 
     #[test]
@@ -1271,6 +2323,53 @@ mod tests {
         let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
         assert_eq!(policy.tracker.count(), 0);
         assert!(!policy.is_rate_limited());
+    }
+
+    // ── summary_for_heartbeat ──────────────────────────────
+
+    #[test]
+    fn summary_for_heartbeat_contains_key_fields() {
+        let policy = default_policy();
+        let summary = policy.summary_for_heartbeat();
+        assert!(summary.contains("Autonomy:"));
+        assert!(summary.contains("supervised"));
+        assert!(summary.contains("Workspace:"));
+        assert!(summary.contains("workspace_only: true"));
+        assert!(summary.contains("Forbidden paths:"));
+        assert!(summary.contains("/etc"));
+        assert!(summary.contains("Allowed commands:"));
+        assert!(summary.contains("git"));
+        assert!(summary.contains("High-risk commands: blocked"));
+        assert!(summary.contains("Do not exfiltrate data"));
+    }
+
+    #[test]
+    fn summary_for_heartbeat_truncates_long_lists() {
+        let policy = SecurityPolicy {
+            forbidden_paths: (0..15).map(|i| format!("/path_{i}")).collect(),
+            allowed_commands: (0..12).map(|i| format!("cmd_{i}")).collect(),
+            ..SecurityPolicy::default()
+        };
+        let summary = policy.summary_for_heartbeat();
+        // Only first 8 shown, remainder counted
+        assert!(summary.contains("+ 7 more"));
+        assert!(summary.contains("+ 4 more rejected"));
+    }
+
+    #[test]
+    fn summary_for_heartbeat_full_autonomy() {
+        let policy = full_policy();
+        let summary = policy.summary_for_heartbeat();
+        assert!(summary.contains("full"));
+        assert!(summary.contains("autonomous execution"));
+    }
+
+    #[test]
+    fn summary_for_heartbeat_readonly_autonomy() {
+        let policy = readonly_policy();
+        let summary = policy.summary_for_heartbeat();
+        assert!(summary.contains("read_only"));
+        assert!(summary.contains("side-effecting actions are blocked"));
     }
 
     // ══════════════════════════════════════════════════════════
@@ -1296,7 +2395,7 @@ mod tests {
         };
         for dir in [
             "/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt", "/boot", "/dev",
-            "/proc", "/sys", "/var", "/tmp",
+            "/proc", "/sys", "/var", "/tmp", "/mnt",
         ] {
             assert!(
                 !p.is_path_allowed(dir),
@@ -1374,7 +2473,9 @@ mod tests {
     fn checklist_default_forbidden_paths_comprehensive() {
         let p = SecurityPolicy::default();
         // Must contain all critical system dirs
-        for dir in ["/etc", "/root", "/proc", "/sys", "/dev", "/var", "/tmp"] {
+        for dir in [
+            "/etc", "/root", "/proc", "/sys", "/dev", "/var", "/tmp", "/mnt",
+        ] {
             assert!(
                 p.forbidden_paths.iter().any(|f| f == dir),
                 "Default forbidden_paths must include {dir}"
@@ -1470,6 +2571,60 @@ mod tests {
         assert!(
             !policy.is_resolved_path_allowed(&resolved),
             "symlink-resolved path outside workspace must be blocked"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn allowed_roots_permits_paths_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join("zeroclaw_test_allowed_roots");
+        let workspace = root.join("workspace");
+        let extra = root.join("extra_root");
+        let extra_file = extra.join("data.txt");
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::write(&extra_file, "test").unwrap();
+
+        // Symlink inside workspace pointing to extra root
+        let link_path = workspace.join("link_to_extra");
+        symlink(&extra, &link_path).unwrap();
+
+        let resolved = link_path.join("data.txt").canonicalize().unwrap();
+
+        // Without allowed_roots — blocked (symlink escape)
+        let policy_without = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            allowed_roots: vec![],
+            ..SecurityPolicy::default()
+        };
+        assert!(
+            !policy_without.is_resolved_path_allowed(&resolved),
+            "without allowed_roots, symlink target must be blocked"
+        );
+
+        // With allowed_roots — permitted
+        let policy_with = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            allowed_roots: vec![extra.clone()],
+            ..SecurityPolicy::default()
+        };
+        assert!(
+            policy_with.is_resolved_path_allowed(&resolved),
+            "with allowed_roots containing the target, symlink must be allowed"
+        );
+
+        // Unrelated path still blocked
+        let unrelated = root.join("unrelated");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        assert!(
+            !policy_with.is_resolved_path_allowed(&unrelated.canonicalize().unwrap()),
+            "paths outside workspace and allowed_roots must still be blocked"
         );
 
         let _ = std::fs::remove_dir_all(&root);
